@@ -14,6 +14,11 @@ AUDIO_DOWNLOAD_PATH = os.getenv('AUDIO_DOWNLOAD_PATH', BASE_DOWNLOAD_FOLDER)
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
 ADMIN_DOWNLOAD_PATH = AUDIO_DOWNLOAD_PATH  # default to .env path
+# 阻止清理操作的保护时间, 文件修改时间在此时间段内，则不执行清理操作, 缺省4小时
+CLEANUP_PROTECTION_TIME = os.getenv('CLEANUP_PROTECTION_TIME', 4 * 3600)
+print(f"AUDIO_DOWNLOAD_PATH: {AUDIO_DOWNLOAD_PATH}")
+print(f"ADMIN_DOWNLOAD_PATH: {ADMIN_DOWNLOAD_PATH}")
+print(f"CLEANUP_PROTECTION_TIME: {CLEANUP_PROTECTION_TIME}")
 
 sessions = {}
 
@@ -175,9 +180,17 @@ def delayed_delete(folder_path):
 
 def emergency_cleanup_container_downloads():
     print("🚨 Running backup cleanup in /app/downloads")
+    current_time = time.time()
     for folder in os.listdir(BASE_DOWNLOAD_FOLDER):
         folder_path = os.path.join(BASE_DOWNLOAD_FOLDER, folder)
         try:
+            # 检查文件夹的修改时间
+            folder_mtime = os.path.getmtime(folder_path)
+            # 如果文件夹修改时间在一定时间内，则跳过清理
+            if current_time - folder_mtime < CLEANUP_PROTECTION_TIME:
+                print(f"⏭️ Skipping recently modified folder: {folder_path}, mtime: {folder_mtime}")
+                continue
+
             shutil.rmtree(folder_path)
             print(f"🗑️ Cleaned: {folder_path}")
         except Exception as e:
