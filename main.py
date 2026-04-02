@@ -67,6 +67,10 @@ def download_media():
     if not spotify_link:
         return jsonify({"status": "error", "output": "No link provided"}), 400
 
+    # Fix QQ Music _v2 URL issue: convert y.qq.com/n/ryqq_v2/playlist/ to y.qq.com/n/ryqq/playlist/
+    # yt-dlp's QQMusicPlaylistIE only supports the old format
+    spotify_link = spotify_link.replace('y.qq.com/n/ryqq_v2/', 'y.qq.com/n/ryqq/')
+
     session_id = str(uuid.uuid4())
     temp_download_folder = os.path.join(BASE_DOWNLOAD_FOLDER, session_id)
     os.makedirs(temp_download_folder, exist_ok=True)
