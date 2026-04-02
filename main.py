@@ -8,6 +8,9 @@ import threading
 import time
 import re  # Add regex for capturing album/playlist name
 
+# 下载超时时间（秒），防止 Google 重定向等问题导致下载挂起
+DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv('DOWNLOAD_TIMEOUT_SECONDS', 180))
+
 app = Flask(__name__, static_folder='web')
 BASE_DOWNLOAD_FOLDER = '/app/downloads'
 AUDIO_DOWNLOAD_PATH = os.getenv('AUDIO_DOWNLOAD_PATH', BASE_DOWNLOAD_FOLDER)
@@ -92,10 +95,13 @@ def generate(is_admin, command, temp_download_folder, session_id):
     try:
         print(f"🎧 Command being run: {' '.join(command)}")
         print(f"📁 Temp download folder: {temp_download_folder}")
+        print(f"⏱️ Download timeout: {DOWNLOAD_TIMEOUT_SECONDS} seconds")
 
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        returncode, lines, timed_out = run_subprocess_with_timeout(
+            command, DOWNLOAD_TIMEOUT_SECONDS
+        )
 
-        for line in process.stdout:
+        for line in lines:
             print(f"▶️ {line.strip()}")
             yield f"data: {line.strip()}\n\n"
 
@@ -104,11 +110,12 @@ def generate(is_admin, command, temp_download_folder, session_id):
             if match:
                 album_name = match.group(1).strip()
 
-        process.stdout.close()
-        process.wait()
+        if timed_out:
+            yield f"data: Error: Download timed out after {DOWNLOAD_TIMEOUT_SECONDS} seconds. The link may be invalid or the Google redirect could not be resolved.\n\n"
+            return
 
-        if process.returncode != 0:
-            yield f"data: Error: Download exited with code {process.returncode}.\n\n"
+        if returncode != 0:
+            yield f"data: Error: Download exited with code {returncode}.\n\n"
             return
 
         # Gather all downloaded audio files
@@ -177,6 +184,44 @@ def generate(is_admin, command, temp_download_folder, session_id):
 def delayed_delete(folder_path):
     time.sleep(300)
     shutil.rmtree(folder_path, ignore_errors=True)
+
+
+def run_subprocess_with_timeout(command, timeout_seconds):
+    """
+    Run a subprocess with a timeout. Returns (return_code, output_lines, timed_out).
+    Uses a background thread to wait for the process.
+    """
+    result = {'returncode': None, 'lines': [], 'timed_out': False}
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    def wait_for_process():
+        try:
+            for line in process.stdout:
+                result['lines'].append(line)
+        except Exception:
+            pass
+        finally:
+            try:
+                result['returncode'] = process.wait()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=wait_for_process)
+    thread.start()
+    thread.join(timeout_seconds)
+
+    if thread.is_alive():
+        # Timeout reached - kill the process
+        result['timed_out'] = True
+        try:
+            process.kill()
+            process.stdout.close()
+        except Exception:
+            pass
+        thread.join(5)  # Give it a moment to die
+
+    return result['returncode'], result['lines'], result['timed_out']
+
 
 def emergency_cleanup_container_downloads():
     print("🚨 Running backup cleanup in /app/downloads")
