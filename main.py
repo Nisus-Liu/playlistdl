@@ -7,10 +7,15 @@ import shutil
 import threading
 import time
 import re  # Add regex for capturing album/playlist name
+import hashlib
+import mutagen
+from mutagen.mp3 import MP3
+from mutagen.flac import FLAC
+from mutagen.m4a import M4A
 from datetime import datetime, timedelta
 
 app = Flask(__name__, static_folder='web')
-BASE_DOWNLOAD_FOLDER = '/app/downloads'
+BASE_DOWNLOAD_FOLDER = os.getenv('BASE_DOWNLOAD_FOLDER', '/app/downloads')
 AUDIO_DOWNLOAD_PATH = os.getenv('AUDIO_DOWNLOAD_PATH', BASE_DOWNLOAD_FOLDER)
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
@@ -23,6 +28,146 @@ print(f"CLEANUP_PROTECTION_TIME: {CLEANUP_PROTECTION_TIME}")
 
 sessions = {}
 sessions_lock = threading.Lock()
+
+# ========== Download History (deduplication) ==========
+class DownloadHistory:
+    """Maintains a hash set of downloaded audio files to prevent duplicates."""
+    
+    def __init__(self, target_dir, scan_interval_seconds=1800):
+        self.target_dir = target_dir
+        self.scan_interval = scan_interval_seconds
+        self._hash_set = set()  # {(artist, title): content_hash}
+        self._mtime_map = {}  # {file_path: mtime}
+        self._lock = threading.Lock()
+        self._last_scan_time = None
+        self._scan_in_progress = False
+    
+    def _get_file_hash(self, file_path):
+        """Compute MD5 hash of entire file content."""
+        h = hashlib.md5()
+        try:
+            with open(file_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(8192), b''):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception as e:
+            print(f"⚠️ Failed to hash {file_path}: {e}")
+            return None
+    
+    def _get_metadata(self, file_path):
+        """Extract (artist, title) from audio file metadata."""
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext == '.mp3':
+                audio = MP3(file_path)
+            elif ext == '.flac':
+                audio = FLAC(file_path)
+            elif ext in ('.m4a', '.aac'):
+                audio = M4A(file_path)
+            else:
+                return (None, None)
+            
+            artist = None
+            title = None
+            if 'artist' in audio:
+                artist = str(audio['artist'][0]) if audio['artist'] else None
+            if 'title' in audio:
+                title = str(audio['title'][0]) if audio['title'] else None
+            return (artist, title)
+        except Exception as e:
+            # Fallback: use filename as title hint
+            return (None, os.path.splitext(os.path.basename(file_path))[0])
+    
+    def scan_directory(self):
+        """Scan target directory and build/update the hash set. Uses mtime for incremental updates."""
+        if not os.path.isdir(self.target_dir):
+            print(f"📂 Download history: target dir not found {self.target_dir}")
+            return
+        
+        current_mtime_map = {}
+        all_files = []
+        
+        for root, _, files in os.walk(self.target_dir):
+            for fname in files:
+                if not fname.lower().endswith(('.mp3', '.m4a', '.flac', '.wav', '.ogg')):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    mtime = os.path.getmtime(fpath)
+                    current_mtime_map[fpath] = mtime
+                    all_files.append((fpath, mtime))
+                except OSError:
+                    continue
+        
+        new_files = []
+        removed_files = []
+        unchanged = []
+        
+        for fpath, mtime in all_files:
+            if fpath not in self._mtime_map:
+                new_files.append((fpath, mtime))
+            else:
+                unchanged.append((fpath, mtime))
+        
+        for fpath in list(self._mtime_map.keys()):
+            if fpath not in current_mtime_map:
+                removed_files.append(fpath)
+        
+        with self._lock:
+            for fpath in removed_files:
+                entry = self._mtime_map.pop(fpath, None)
+            
+            for fpath, mtime in new_files:
+                file_hash = self._get_file_hash(fpath)
+                if file_hash:
+                    artist, title = self._get_metadata(fpath)
+                    key = (artist or '', title or '', file_hash)
+                    self._hash_set.add(key)
+                self._mtime_map[fpath] = mtime
+        
+        print(f"📊 Download history scan done: +{len(new_files)} new, -{len(removed_files)} removed, {len(unchanged)} unchanged (total {len(self._hash_set)})")
+        self._last_scan_time = datetime.now()
+    
+    def is_duplicate(self, file_path):
+        """Check if a file (by its content hash) is already in history."""
+        with self._lock:
+            file_hash = self._get_file_hash(file_path)
+            if not file_hash:
+                return False
+            artist, title = self._get_metadata(file_path)
+            key = (artist or '', title or '', file_hash)
+            return key in self._hash_set
+    
+    def add_file(self, file_path):
+        """Add a newly downloaded file to the history."""
+        file_hash = self._get_file_hash(file_path)
+        if not file_hash:
+            return
+        artist, title = self._get_metadata(file_path)
+        with self._lock:
+            key = (artist or '', title or '', file_hash)
+            self._hash_set.add(key)
+            try:
+                self._mtime_map[file_path] = os.path.getmtime(file_path)
+            except OSError:
+                pass
+    
+    def start_background_scan(self):
+        """Start periodic background scanning."""
+        def loop():
+            while True:
+                time.sleep(self.scan_interval)
+                self.scan_directory()
+        
+        # Initial scan
+        self.scan_directory()
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+        print(f"🔄 Download history background scan started (interval={self.scan_interval}s)")
+
+# Global download history instance (initialized after ADMIN_DOWNLOAD_PATH is set)
+download_history = None
+
 
 def cleanup_expired_sessions(max_age_hours=24):
     """Remove sessions older than max_age_hours"""
@@ -43,6 +188,11 @@ def session_cleanup_loop():
         cleanup_expired_sessions()
 
 os.makedirs(BASE_DOWNLOAD_FOLDER, exist_ok=True)
+
+# Initialize download history for deduplication (scan every 30 min)
+history_scan_interval = int(os.getenv('HISTORY_SCAN_INTERVAL', 1800))
+download_history = DownloadHistory(ADMIN_DOWNLOAD_PATH, scan_interval_seconds=history_scan_interval)
+download_history.start_background_scan()
 
 @app.route('/')
 def serve_index():
@@ -168,6 +318,28 @@ def generate(is_admin, command, temp_download_folder, session_id):
             for file_path in valid_audio_files:
                 filename = os.path.basename(file_path)
 
+                # Check for duplicate before moving
+                if download_history and download_history.is_duplicate(file_path):
+                    artist, title = None, None
+                    try:
+                        ext = os.path.splitext(file_path)[1].lower()
+                        if ext == '.mp3':
+                            audio = MP3(file_path)
+                        elif ext == '.flac':
+                            audio = FLAC(file_path)
+                        elif ext in ('.m4a', '.aac'):
+                            audio = M4A(file_path)
+                        if 'title' in audio and audio['title']:
+                            title = str(audio['title'][0])
+                        if 'artist' in audio and audio['artist']:
+                            artist = str(audio['artist'][0])
+                    except Exception:
+                        pass
+                    track_name = f"{artist} - {title}" if artist and title else filename
+                    print(f"⏭️ Duplicate skipped: {track_name}")
+                    yield f"data: ⏭️ Duplicate skipped: {track_name}\n\n"
+                    continue
+
                 if 'General Conference' in filename and '｜' in filename:
                     speaker_name = filename.split('｜')[0].strip()
                     target_path = os.path.join(ADMIN_DOWNLOAD_PATH, speaker_name, filename)
@@ -180,6 +352,8 @@ def generate(is_admin, command, temp_download_folder, session_id):
                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
                 try:
                     shutil.move(file_path, target_path)
+                    if download_history:
+                        download_history.add_file(target_path)
                 except Exception as move_error:
                     print(f"❌ Failed to move {file_path} to {target_path}: {move_error}")
 
@@ -247,7 +421,7 @@ def schedule_emergency_cleanup(interval_seconds=3600):
 
 @app.route('/set-download-path', methods=['POST'])
 def set_download_path():
-    global ADMIN_DOWNLOAD_PATH
+    global ADMIN_DOWNLOAD_PATH, download_history
     if not is_logged_in():
         return jsonify({"success": False, "message": "Unauthorized"}), 401
 
@@ -265,6 +439,9 @@ def set_download_path():
             return jsonify({"success": False, "message": f"Cannot create path: {str(e)}"}), 500
 
     ADMIN_DOWNLOAD_PATH = new_path
+    # Update history target and rescan
+    download_history = DownloadHistory(ADMIN_DOWNLOAD_PATH, scan_interval_seconds=history_scan_interval)
+    download_history.start_background_scan()
     return jsonify({"success": True, "new_path": ADMIN_DOWNLOAD_PATH})
 
 
