@@ -7,6 +7,7 @@ import shutil
 import threading
 import time
 import re  # Add regex for capturing album/playlist name
+from datetime import datetime, timedelta
 
 app = Flask(__name__, static_folder='web')
 BASE_DOWNLOAD_FOLDER = '/app/downloads'
@@ -21,6 +22,25 @@ print(f"ADMIN_DOWNLOAD_PATH: {ADMIN_DOWNLOAD_PATH}")
 print(f"CLEANUP_PROTECTION_TIME: {CLEANUP_PROTECTION_TIME}")
 
 sessions = {}
+sessions_lock = threading.Lock()
+
+def cleanup_expired_sessions(max_age_hours=24):
+    """Remove sessions older than max_age_hours"""
+    now = datetime.now()
+    expired = []
+    with sessions_lock:
+        for sid, last_active in list(sessions.items()):
+            if isinstance(last_active, datetime) and (now - last_active) > timedelta(hours=max_age_hours):
+                expired.append(sid)
+        for sid in expired:
+                del sessions[sid]
+    if expired:
+        print(f"🧹 Cleaned up {len(expired)} expired sessions")
+
+def session_cleanup_loop():
+    while True:
+        time.sleep(3600)  # Run every hour
+        cleanup_expired_sessions()
 
 os.makedirs(BASE_DOWNLOAD_FOLDER, exist_ok=True)
 
@@ -39,7 +59,8 @@ def login():
     password = data.get('password')
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
         session_id = str(uuid.uuid4())
-        sessions[session_id] = username
+        with sessions_lock:
+            sessions[session_id] = datetime.now()
         response = jsonify({"success": True})
         response.set_cookie('session', session_id)
         return response
@@ -47,10 +68,18 @@ def login():
 
 def is_logged_in():
     session_id = request.cookies.get('session')
-    return session_id in sessions
+    with sessions_lock:
+        if session_id in sessions:
+            sessions[session_id] = datetime.now()  # Update last active time
+            return True
+    return False
 
 @app.route('/logout', methods=['POST'])
 def logout():
+    session_id = request.cookies.get('session')
+    if session_id:
+        with sessions_lock:
+            sessions.pop(session_id, None)
     response = jsonify({"success": True})
     response.delete_cookie('session')  # Remove session cookie
     return response
@@ -69,13 +98,18 @@ def download_media():
 
     # Fix QQ Music _v2 URL issue: convert y.qq.com/n/ryqq_v2/playlist/ to y.qq.com/n/ryqq/playlist/
     # yt-dlp's QQMusicPlaylistIE only supports the old format
-    spotify_link = spotify_link.replace('y.qq.com/n/ryqq_v2/', 'y.qq.com/n/ryqq/')
+    # Only apply to QQ Music links to avoid affecting other platforms
+    if 'y.qq.com/n/ryqq_v2/' in spotify_link:
+        spotify_link = spotify_link.replace('y.qq.com/n/ryqq_v2/', 'y.qq.com/n/ryqq/')
 
     session_id = str(uuid.uuid4())
     temp_download_folder = os.path.join(BASE_DOWNLOAD_FOLDER, session_id)
     os.makedirs(temp_download_folder, exist_ok=True)
 
-    if "spotify" in spotify_link:
+    # More robust platform detection
+    is_spotify = 'spotify.com' in spotify_link
+
+    if is_spotify:
         command = [
             'spotdl',
             '--output', f"{temp_download_folder}/{{artist}}/{{album}}/{{title}}.{{output-ext}}",
@@ -165,6 +199,9 @@ def generate(is_admin, command, temp_download_folder, session_id):
 
             yield f"data: DOWNLOAD: {session_id}/{zip_filename}\n\n"
 
+            # Schedule cleanup of the temp folder (including zip)
+            threading.Thread(target=delayed_delete, args=(temp_download_folder,)).start()
+
         else:
             from urllib.parse import quote
             relative_path = os.path.relpath(valid_audio_files[0], start=temp_download_folder)
@@ -249,6 +286,7 @@ def serve_download(session_id, filename):
     return send_from_directory(session_download_folder, filename, as_attachment=True)
 
 schedule_emergency_cleanup()
+threading.Thread(target=session_cleanup_loop, daemon=True).start()
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
 
